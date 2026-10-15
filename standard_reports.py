@@ -220,44 +220,88 @@ def weekly_cohort(df: pd.DataFrame, cols: Dict[str, Optional[str]], schema: Dict
     visitor, ts_col = cols["visitor"], cols["timestamp"]
     if not (visitor and ts_col):
         return _na("cohort", "A visitor id and timestamp are required for cohort retention.")
+    return cohort_retention(df, visitor, ts_col, schema, gran="W")
+
+
+def _period_floor(series: pd.Series, gran: str) -> pd.Series:
+    if gran == "W":
+        return analytics_schema.utc_week_start(series)
+    if gran == "M":
+        return series.dt.to_period("M").dt.to_timestamp()
+    return series.dt.normalize()
+
+
+def _period_index(cohort_start: pd.Series, period_start: pd.Series, gran: str) -> pd.Series:
+    if gran == "W":
+        return (period_start - cohort_start).dt.days // 7
+    if gran == "M":
+        return (period_start.dt.year - cohort_start.dt.year) * 12 + (period_start.dt.month - cohort_start.dt.month)
+    return (period_start - cohort_start).dt.days
+
+
+def _scalar_index(cohort_start: pd.Timestamp, period_start: pd.Timestamp, gran: str) -> int:
+    if gran == "W":
+        return int((period_start - cohort_start).days // 7)
+    if gran == "M":
+        return int((period_start.year - cohort_start.year) * 12 + (period_start.month - cohort_start.month))
+    return int((period_start - cohort_start).days)
+
+
+def _add_periods(start: pd.Timestamp, count: int, gran: str) -> pd.Timestamp:
+    if gran == "W":
+        return start + pd.Timedelta(days=7 * count)
+    if gran == "M":
+        return start + pd.DateOffset(months=count)
+    return start + pd.Timedelta(days=count)
+
+
+def cohort_retention(
+    df: pd.DataFrame,
+    visitor: str,
+    ts_col: str,
+    schema: Dict[str, Any],
+    gran: str = "W",
+) -> Dict[str, Any]:
+    """Shared cohort-retention core used by BOTH the standard report and the
+    personal-inquiry engine, so their numbers can never diverge.
+
+    * Periods are Monday-start UTC weeks (via the shared schema helper).
+    * A visitor counts at most once per period (unique visitor-period records).
+    * A cohort is the period of a visitor's first observed activity.
+    * Every observable period index is present, so an observable period with no
+      return is a real 0% (not a missing column).
+    * Unobservable future periods, and the dataset's final partial period when
+      the rate would read 0%, are blank (N/A) - never 0.
+    """
     work = df[[visitor, ts_col]].copy()
     work["__ts"] = _to_datetime(work, ts_col, schema)
     work = work.dropna(subset=[visitor, "__ts"])
     if work.empty:
         return _na("cohort", "No valid timestamped rows were found.")
 
-    # Monday-start UTC week (shared helper, so active/cohort weeks cannot drift).
-    c = analytics_schema.column_by_name(schema, ts_col)
-    work["__week"] = analytics_schema.utc_week_start(work[ts_col], c.get("epoch_unit") if c else None)
-
-    # Unique visitor-week records (a visitor active many times in a week counts once).
-    visitor_week = work[[visitor, "__week"]].drop_duplicates()
-    first_week = visitor_week.groupby(visitor)["__week"].min()
-    visitor_week = visitor_week.assign(__cohort=visitor_week[visitor].map(first_week))
-    visitor_week["__index"] = ((visitor_week["__week"] - visitor_week["__cohort"]).dt.days // 7).astype(int)
+    work["__period"] = _period_floor(work["__ts"], gran)
+    visitor_week = work[[visitor, "__period"]].drop_duplicates()
+    first_period = visitor_week.groupby(visitor)["__period"].min()
+    visitor_week = visitor_week.assign(__cohort=visitor_week[visitor].map(first_period))
+    visitor_week["__index"] = _period_index(visitor_week["__cohort"], visitor_week["__period"], gran).astype(int)
 
     pivot = visitor_week.groupby(["__cohort", "__index"]).size().unstack(fill_value=0).sort_index()
-    last_week = work["__week"].max()
+    last_period = work["__period"].max()
     last_ts = work["__ts"].max()
-    # Include every observable week index, so an observable week in which nobody
-    # returned is a real 0% (not a missing column). Unobservable cells become N/A below.
-    max_col = int((last_week - pivot.index.min()).days // 7) if len(pivot.index) else 0
+    max_col = _scalar_index(pivot.index.min(), last_period, gran) if len(pivot.index) else 0
     pivot = pivot.reindex(columns=range(0, max_col + 1), fill_value=0)
     sizes = pivot[0]
     retention = pivot.div(sizes.replace(0, pd.NA), axis=0) * 100
 
     for cohort_start in retention.index:
-        max_index = int((last_week - cohort_start).days // 7)
+        max_index = _scalar_index(cohort_start, last_period, gran)
         future = [c for c in retention.columns if c > max_index]
         if future:
             retention.loc[cohort_start, future] = pd.NA
-        # The dataset ends mid-week, so its last week is only partially observed. A
-        # 0% there is ambiguous (a visitor could still return later that week), so it
-        # must be N/A. A non-zero cell is a real observed return and is kept.
         if max_index in retention.columns:
-            week_start = cohort_start + pd.Timedelta(days=7 * max_index)
-            fully_observed = last_ts >= week_start + pd.Timedelta(days=7) - pd.Timedelta(seconds=1)
-            if not fully_observed and retention.at[cohort_start, max_index] == 0:
+            period_start = _add_periods(cohort_start, max_index, gran)
+            period_end = _add_periods(period_start, 1, gran) - pd.Timedelta(seconds=1)
+            if last_ts < period_end and retention.at[cohort_start, max_index] == 0:
                 retention.at[cohort_start, max_index] = pd.NA
 
     retention = retention.round(1)
@@ -266,20 +310,23 @@ def weekly_cohort(df: pd.DataFrame, cols: Dict[str, Optional[str]], schema: Dict
     table.insert(1, "cohort_size", sizes.reindex(retention.index).astype("Int64").values)
     table["cohort_start"] = pd.to_datetime(table["cohort_start"]).dt.strftime("%Y-%m-%d")
 
+    unit = {"W": "week", "M": "month", "D": "day"}.get(gran, "period")
     notes = [
-        "Weeks start on Monday (UTC). One visitor counts at most once per week (unique visitor-week records).",
-        "Cohort size is the number of unique visitors first observed in that week.",
-        "Blank (N/A) cells are weeks a cohort could not have observed yet, or the dataset's "
-        "final partial week where a 0% would be ambiguous - they are not zero.",
+        f"Periods start on {'Monday (UTC)' if gran == 'W' else 'the calendar boundary'}. "
+        f"One visitor counts at most once per {unit} (unique visitor-{unit} records).",
+        f"Cohort size is the number of unique visitors first observed in that {unit}.",
+        f"Blank (N/A) cells are periods a cohort could not have observed yet, or the dataset's "
+        f"final partial {unit} where a 0% would be ambiguous - they are not zero.",
     ]
     return {
         "report": "cohort",
         "available": True,
         "reason": "",
+        "granularity": gran,
         "metrics": [
             ("Cohorts", int(len(sizes))),
-            ("Weeks observed", int(retention.shape[1])),
-            ("Unique visitor-week records", int(len(visitor_week))),
+            (f"{unit.capitalize()}s observed", int(retention.shape[1])),
+            (f"Unique visitor-{unit} records", int(len(visitor_week))),
         ],
         "table": table,
         "chart": {"kind": "heatmap", "title": "Weekly cohort retention % (N/A = not yet observable)"},

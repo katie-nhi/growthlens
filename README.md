@@ -42,7 +42,10 @@ being limited to the fixed reports:
   is validated against the dataset and then executed **locally with pandas**.
 - You get the interpreted question, the proposed metric definitions, the real
   computed table, an appropriate Plotly chart, a business interpretation,
-  limitations, and a CSV download.
+  limitations, a CSV download, and an **audit trail** describing exactly how the
+  number was produced (method, numerator/denominator, filters, source rows).
+- Results are tied to a fingerprint of the data, schema and question: if you
+  change any of them, the previous analysis is cleared rather than left stale.
 
 This is a real analysis workflow, **not a chatbot**: the model never invents
 results, never runs code, and never sees raw rows. The AI connection is
@@ -64,6 +67,9 @@ association (correlation) - always computed with pandas on your uploaded data.
 - Revenue is never calculated without a numeric amount/currency column.
 - If a question cannot be answered, GrowthLens explains why and lists the
   missing fields.
+- Filters **fail closed**: an unsupported operator, a non-numeric comparison
+  value, or a comparison on a non-numeric column makes the whole question
+  unanswerable rather than silently returning a different result.
 - No LLM-generated code, SQL or shell is ever executed.
 
 ### 2. Build an Analysis Blueprint (no upload)
@@ -110,11 +116,56 @@ GrowthLens then returns a short **Analysis Summary**, then four sections
   **sanitized schema** (column names, types, roles and low-cardinality category
   labels - never raw rows, never values from identifier-like or sensitive
   columns) and the **aggregated results** used for the explanation.
+- Result rows are further sanitized before leaving the process: any grouping
+  column that is an identifier or sensitive (email, name, ...) has its values
+  redacted, and literal filter values in the plan are removed.
+- For an **correlation** analysis, the individual `(x, y)` observation pairs are
+  never sent: only the Pearson correlation, the valid-pair count and per-column
+  aggregate statistics (count/mean/std) leave the process.
+- If a plan is invalid or cannot be answered, no external explanation request is
+  made at all - the reason is generated locally. Filter errors name only the
+  column and operator, never the literal value you typed, and all diagnostic
+  notes are scrubbed of filter literals and email-like strings before any send.
 - Without a configured provider, the section shows "AI connection required" and
   runs nothing.
 - API keys live in Streamlit Secrets or environment variables, never in source
   files or GitHub.
 - The rule-based Blueprint outputs remain explicitly labelled rule-based / non-AI.
+
+## Abuse & cost limits (public deployments)
+
+To protect a publicly reachable deployment from runaway provider spend, the AI
+section enforces a per-session analysis cap, a short per-session cooldown and a
+process-wide cap, and handles provider HTTP 429/timeouts with a clear message.
+Tune them in Secrets or environment variables:
+
+```toml
+GROWTHLENS_LLM_MAX_PER_SESSION = "20"   # analyses per browser session
+GROWTHLENS_LLM_COOLDOWN_SECONDS = "3"   # minimum seconds between analyses
+GROWTHLENS_LLM_MAX_GLOBAL = "200"       # accepted analyses per server process
+GROWTHLENS_LLM_TIMEOUT = "60"           # per-request timeout (seconds)
+GROWTHLENS_LLM_DISABLED = "false"       # owner switch: "true" turns AI off entirely
+```
+
+**What these limits do and do not protect.** The counters are held **in the
+server process's memory** and are best-effort for a public demo, not
+production-grade billing guardrails:
+
+- The **process-wide cap** bounds total provider spend per running server, but it
+  **resets to 0 whenever the process restarts**.
+- The **per-session cap and cooldown** are stored in `st.session_state`, so they
+  are per browser session and can be bypassed by reloading or opening a new
+  session.
+- The **explanation** is a second provider request made within the same inquiry;
+  it is not separately counted or checked (it is bounded only indirectly, one per
+  accepted inquiry, plus the provider's own limits).
+- They are **not distributed** (no shared store), so multiple replicas do not
+  share a budget.
+
+For a public deployment that should not offer AI to anonymous visitors, set
+`GROWTHLENS_LLM_DISABLED = "true"` (or remove the key). The UI then shows the
+same "AI connection required" state and the feature is inaccessible.
+
 
 ## AI configuration (optional)
 
@@ -146,18 +197,23 @@ streamlit run app.py
 ## Tests
 
 The Blueprint engine and the inquiry engine use only the standard library and
-pandas, so they run without Streamlit or a network:
+pandas, so they run without Streamlit or a network. No LLM API key is required:
+every AI code path is exercised with a monkeypatched client.
 
 ```
+python tests/run_all.py                      # run every test file below
 python tests/test_blueprint_engine.py      # blueprint rules
-python tests/test_analytics_schema.py      # schema inference
+python tests/test_analytics_schema.py      # schema inference + outbound sanitization
 python tests/test_analytics_engine.py      # plan validation + pandas execution
 python tests/test_standard_reports.py      # overview, funnel, cohort, segmentation
+python tests/test_inquiry_suggestions.py   # example questions + result digests
 python tests/test_llm.py                   # optional LLM client (mocked, no network)
 ```
 
 All tests use synthetic data only - including repeated and out-of-order events,
-missing columns and epoch timestamps.
+missing columns and epoch timestamps. A GitHub Actions workflow
+(`.github/workflows/tests.yml`) runs `tests/run_all.py` on every push and pull
+request with the AI deliberately unconfigured.
 
 ## Project layout
 
@@ -166,14 +222,17 @@ missing columns and epoch timestamps.
 | `app.py` | Homepage and navigation between modes |
 | `data_analysis.py` | Data Analysis mode (upload, preview, reports, inquiry) |
 | `standard_reports.py` | Executive Overview, funnel, cohort, segmentation (pandas only) |
-| `analytics_schema.py` | Schema/role inference + sanitized LLM payload |
+| `analytics_schema.py` | Schema/role inference, sanitized LLM payload + outbound sanitizers |
 | `analytics_engine.py` | Validates structured plans and computes metrics with pandas |
-| `inquiry.py` | "Ask GrowthLens AI" UI section (examples, consent, results) |
-| `llm.py` | Optional LLM client (interpret question, explain results) |
+| `inquiry.py` | "Ask GrowthLens AI" UI section (examples, consent, results, audit trail) |
+| `llm.py` | Optional LLM client (interpret question, explain results, limits) |
 | `blueprint.py` | Analysis Blueprint mode (form + results UI) |
 | `blueprint_engine.py` | Rule-based Blueprint recommendation engine (stdlib only) |
+| `tests/run_all.py` | Runs every test file and fails if any fails |
 | `tests/test_blueprint_engine.py` | Unit tests for the Blueprint engine |
-| `tests/test_analytics_schema.py` | Unit tests for schema inference |
+| `tests/test_analytics_schema.py` | Unit tests for schema inference + sanitization |
 | `tests/test_analytics_engine.py` | Unit tests for plan validation/execution |
 | `tests/test_standard_reports.py` | Unit tests for the standard reports |
+| `tests/test_inquiry_suggestions.py` | Unit tests for examples + result digests |
 | `tests/test_llm.py` | Unit tests for the optional LLM client |
+| `.github/workflows/tests.yml` | CI: runs the suite with AI disconnected |

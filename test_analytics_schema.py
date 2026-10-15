@@ -102,11 +102,82 @@ def test_public_payload_has_no_raw_rows_or_identifier_values():
     assert all("top_values" not in c for c in payload["columns"] if c["name"] in ("user_id", "email"))
 
 
-def test_public_payload_shares_low_cardinality_dimensions():
+def test_public_payload_default_hides_category_labels():
     payload = schema_mod.public_payload(_event_log(), schema_mod.infer_schema(_event_log()))
+    device_entry = [c for c in payload["columns"] if c["name"] == "device"][0]
+    assert "top_values" not in device_entry
+
+
+def test_public_payload_shares_low_cardinality_dimensions_when_opted_in():
+    payload = schema_mod.public_payload(
+        _event_log(), schema_mod.infer_schema(_event_log()), include_categories=True
+    )
     device_entry = [c for c in payload["columns"] if c["name"] == "device"][0]
     assert "top_values" in device_entry
     assert set(device_entry["top_values"]) <= {"ios", "android"}
+
+
+def test_sanitize_table_preview_redacts_identifiers_and_pii():
+    df = pd.DataFrame(
+        {
+            "visitorid": ["VISITOR_SECRET_1", "VISITOR_SECRET_1", "VISITOR_SECRET_2"],
+            "email": ["alice@example.com", "alice@example.com", "bob@example.com"],
+            "amount": [1.0, 2.0, 3.0],
+        }
+    )
+    schema = schema_mod.infer_schema(df)
+    table = pd.DataFrame(
+        {
+            "visitorid": ["VISITOR_SECRET_1", "VISITOR_SECRET_2"],
+            "email": ["alice@example.com", "bob@example.com"],
+            "rows": [2, 1],
+        }
+    )
+    out = schema_mod.sanitize_table_preview(table, schema)
+    blob = str(out["rows"])
+    assert "VISITOR_SECRET_1" not in blob
+    assert "alice@example.com" not in blob
+    assert set(out["redacted_columns"]) == {"visitorid", "email"}
+    # a non-sensitive numeric aggregate column is preserved
+    assert out["rows"][0]["rows"] == 2
+
+
+def test_sanitize_table_preview_keeps_safe_dimension_values():
+    df = _event_log()
+    schema = schema_mod.infer_schema(df)
+    table = pd.DataFrame({"device": ["ios", "android"], "rows": [4, 3]})
+    out = schema_mod.sanitize_table_preview(table, schema)
+    assert out["redacted_columns"] == []
+    assert {r["device"] for r in out["rows"]} == {"ios", "android"}
+
+
+def test_sanitize_plan_redacts_filter_values():
+    schema = schema_mod.infer_schema(_event_log())
+    plan = {
+        "intent": "groupby_aggregate",
+        "group_by": ["device"],
+        "filters": [{"column": "email", "op": "==", "value": "alice@example.com"}],
+    }
+    safe = schema_mod.sanitize_plan(plan, schema)
+    assert safe["filters"][0]["value"] == "<redacted>"
+    assert safe["filters"][0]["column"] == "email"
+    # original plan untouched
+    assert plan["filters"][0]["value"] == "alice@example.com"
+
+
+def test_sanitize_notes_redacts_filter_literals_and_emails():
+    plan = {"filters": [{"column": "amount", "op": ">", "value": "alice@example.com"}]}
+    notes = [
+        "Filter on 'amount' (> alice@example.com) could not be applied",
+        "contact bob@example.org for details",
+        "a harmless note",
+    ]
+    out = schema_mod.sanitize_notes(notes, plan=plan)
+    blob = " ".join(out)
+    assert "alice@example.com" not in blob
+    assert "bob@example.org" not in blob
+    assert "a harmless note" in out
+
 
 
 def test_utc_week_start_is_monday():
