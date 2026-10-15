@@ -11,7 +11,7 @@ sees raw rows.
 
 from __future__ import annotations
 
-import json
+import hashlib
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -232,16 +232,19 @@ def _make_chart(result: Dict[str, Any]) -> Optional[Any]:
 def _plan_definitions(plan: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     metric = plan.get("metric") or {}
-    if metric:
-        rows.append({"item": "Metric", "definition": f"{metric.get('operation', 'count')} of {metric.get('column') or 'rows'}"
-                     + (f" ({metric.get('name')})" if metric.get("name") else "")})
+    if metric and (metric.get("operation") or metric.get("column")):
+        definition = f"{metric.get('operation') or 'count'} of {metric.get('column') or 'rows'}"
+        if metric.get("name"):
+            definition += f" ({metric['name']})"
+        rows.append({"item": "Metric", "definition": definition})
     if plan.get("group_by"):
         rows.append({"item": "Group by", "definition": ", ".join(plan["group_by"])})
     if plan.get("filters"):
         rows.append({"item": "Filters", "definition": "; ".join(
             f"{f.get('column')} {f.get('op')} {f.get('value')}" for f in plan["filters"])})
-    if plan.get("time"):
-        rows.append({"item": "Time", "definition": f"{plan['time'].get('period', 'W')} by {plan['time'].get('column')}"})
+    time = plan.get("time") or {}
+    if time.get("column"):
+        rows.append({"item": "Time", "definition": f"{time.get('period', 'W')} by {time['column']}"})
     if plan.get("user_id"):
         rows.append({"item": "Unique visitor id", "definition": plan["user_id"]})
     if plan.get("stages"):
@@ -252,18 +255,98 @@ def _plan_definitions(plan: Dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _digest(result: Dict[str, Any]) -> Dict[str, Any]:
+def _method_notes(plan: Dict[str, Any], result: Dict[str, Any], schema: Dict[str, Any]) -> List[str]:
+    """Auditable description of exactly how the number was produced."""
+    notes: List[str] = []
+    intent = plan.get("intent")
+    intent_labels = {
+        "groupby_aggregate": "grouped aggregation",
+        "distinct_count": "distinct count",
+        "time_trend": "grouped aggregation over time",
+        "event_stages": "unique visitors per event value",
+        "funnel": "strictly ordered per-visitor funnel (each stage after the previous)",
+        "cohort": "period cohort retention (unique visitor-period records)",
+        "correlation": "Pearson association between two numeric columns",
+    }
+    if intent in intent_labels:
+        notes.append(f"Method: {intent_labels[intent]}.")
     table = result.get("table")
-    preview = []
     if table is not None and not table.empty:
-        preview = json.loads(table.head(25).to_json(orient="records", date_format="iso"))
+        notes.append(f"Result rows returned: {int(len(table))}.")
+    metric = plan.get("metric") or {}
+    if intent in ("groupby_aggregate", "time_trend") and (metric.get("operation") or metric.get("column")):
+        col = metric.get("column") or "rows"
+        notes.append(
+            f"Numerator/denominator: {metric.get('operation') or 'count'} of {col}; "
+            f"one value per group"
+            + (f"; non-null {col} values only" if metric.get("operation") in ("sum", "mean", "median") else "") + "."
+        )
+    if plan.get("filters"):
+        notes.append(f"Filters applied: {len(plan['filters'])} (see metric definitions above).")
+    notes.append(f"Source rows considered: {schema.get('row_count', 'unknown'):,}."
+                 if isinstance(schema.get("row_count"), int) else "Source rows considered: unknown.")
+    return notes
+
+
+def _field_availability(plan: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Categorise the dataset's fields relative to what the plan used.
+
+    * used        - columns the plan references (validated to exist)
+    * unused      - available dimension/measure/event/id/timestamp columns the plan ignored
+    * uncertain   - identifier-like columns (values must not be aggregated)
+    """
+    referenced = set()
+    for key in ("group_by",):
+        referenced.update(plan.get(key) or [])
+    for key in ("user_id", "event_column", "timestamp", "x", "y"):
+        if plan.get(key):
+            referenced.add(plan[key])
+    if (plan.get("time") or {}).get("column"):
+        referenced.add(plan["time"]["column"])
+    for f in plan.get("filters") or []:
+        if f.get("column"):
+            referenced.add(f["column"])
+    if (plan.get("metric") or {}).get("column"):
+        referenced.add(plan["metric"]["column"])
+
+    available = set(
+        list(schema.get("dimensions", []))
+        + list(schema.get("measures", []))
+        + list(schema.get("events", []))
+        + list(schema.get("timestamps", []))
+        + list(schema.get("identifiers", []))
+    )
+    uncertain = sorted(available & set(schema.get("identifiers", [])))
     return {
+        "used_columns": sorted(referenced),
+        "available_unused": sorted(available - referenced),
+        "uncertain_identifier_columns": uncertain,
+    }
+
+
+
+def _digest(result: Dict[str, Any], schema: Dict[str, Any], field_availability: Optional[Dict[str, Any]] = None, plan: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    table = result.get("table")
+    digest = {
         "intent": result.get("intent"),
         "scalar": result.get("scalar"),
         "row_count": 0 if table is None else int(len(table)),
-        "table_preview": preview,
-        "notes": result.get("notes", []),
+        "redacted_columns": [],
+        "notes": analytics_schema.sanitize_notes(result.get("notes", []), plan=plan),
     }
+    if result.get("intent") == "correlation":
+        # Never transmit raw observation pairs.
+        meta_summary = (result.get("meta") or {}).get("summary", {})
+        digest["correlation_summary"] = meta_summary
+        digest["table_preview"] = []
+        digest["redacted_columns"] = ["x", "y"]
+    else:
+        sanitized = analytics_schema.sanitize_table_preview(table, schema, max_rows=10)
+        digest["table_preview"] = sanitized["rows"]
+        digest["redacted_columns"] = sanitized["redacted_columns"]
+    if field_availability is not None:
+        digest["field_availability"] = field_availability
+    return digest
 
 
 def _render_result(bundle: Dict[str, Any]) -> None:
@@ -309,13 +392,20 @@ def _render_result(bundle: Dict[str, Any]) -> None:
         for item in limitations:
             st.write(f"- {item}")
 
+    with st.expander("How this number was produced (audit trail)", expanded=False):
+        for item in _method_notes(plan, result, bundle.get("schema") or {}):
+            st.write(f"- {item}")
+
 
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
 def _run_pipeline(df: pd.DataFrame, schema: Dict[str, Any], question: str) -> Dict[str, Any]:
-    payload = analytics_schema.public_payload(df, schema)
+    # The planner needs the sanitized schema (including low-cardinality category
+    # labels so it can name funnel stages). Identifier/PII columns never expose
+    # values, and this only runs after the user has given consent.
+    payload = analytics_schema.public_payload(df, schema, include_categories=True)
     plan = llm.interpret_question(question, payload, grain_hint=schema.get("grain_guess"))
 
     ok, errors, missing = analytics_engine.validate_plan(plan, schema)
@@ -332,21 +422,54 @@ def _run_pipeline(df: pd.DataFrame, schema: Dict[str, Any], question: str) -> Di
             reason = "This question cannot be answered from the uploaded data."
         result = dict(result)
         result["notes"] = [reason] + result.get("notes", [])
-    else:
-        result = analytics_engine.execute_plan(df, plan, schema)
+        # Invalid/unsupported plans never trigger an external explanation call:
+        # the reason is deterministic and local, so nothing (including any
+        # user-supplied literal) can leave the process.
+        return {
+            "question": question,
+            "plan": plan,
+            "result": result,
+            "explanation": reason,
+            "unsupported": True,
+            "schema": schema,
+        }
+
+    result = analytics_engine.execute_plan(df, plan, schema)
 
     explanation = ""
     try:
-        explanation = llm.explain_findings(question, plan, _digest(result))
+        # Only sanitized, aggregated results leave the process: identifier/PII
+        # value columns are redacted and literal plan values are removed.
+        safe_plan = analytics_schema.sanitize_plan(plan, schema)
+        explanation = llm.explain_findings(
+            question, safe_plan, _digest(result, schema, _field_availability(plan, schema), plan)
+        )
     except llm.LLMError as exc:
         explanation = f"(Interpretation unavailable: {exc})"
 
-    return {"question": question, "plan": plan, "result": result, "explanation": explanation, "unsupported": unsupported}
+    return {"question": question, "plan": plan, "result": result, "explanation": explanation, "unsupported": False, "schema": schema}
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+def _input_fingerprint(df: pd.DataFrame, schema: Dict[str, Any], question: str) -> str:
+    """Stable fingerprint of the inputs a stored result was computed from.
+
+    Includes a content-based digest of the dataset (so two same-shape but
+    different-content datasets invalidate prior results), alongside schema/roles,
+    grain and the question.
+    """
+    roles = ";".join(f"{c['name']}:{c['role']}" for c in schema.get("columns", []))
+    try:
+        h = pd.util.hash_pandas_object(df, index=True).values
+        content = hashlib.sha256(h.tobytes()).hexdigest()
+    except Exception:
+        content = hashlib.sha256(df.to_csv(index=False).encode("utf-8")).hexdigest()
+    payload = f"{content}|{df.shape}|{'|'.join(map(str, df.columns))}|{schema.get('grain_guess')}|{roles}|{question.strip()}"
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
 
 def render_inquiry(df: pd.DataFrame) -> None:
     st.divider()
@@ -403,12 +526,21 @@ def render_inquiry(df: pd.DataFrame) -> None:
         else:
             with st.spinner("Interpreting your question and computing results..."):
                 try:
-                    st.session_state["inquiry_result"] = _run_pipeline(df, schema, question.strip())
+                    bundle = _run_pipeline(df, schema, question.strip())
+                    bundle["fingerprint"] = _input_fingerprint(df, schema, question.strip())
+                    st.session_state["inquiry_result"] = bundle
                 except llm.LLMError as exc:
                     st.session_state.pop("inquiry_result", None)
                     st.error(f"AI request failed: {exc}")
 
     bundle = st.session_state.get("inquiry_result")
+    if bundle:
+        if bundle.get("fingerprint") != _input_fingerprint(df, schema, question):
+            # Inputs changed since the result was produced: do not show a stale answer.
+            st.session_state.pop("inquiry_result", None)
+            bundle = None
+            st.info("Your question or data changed, so the previous analysis was cleared. "
+                    "Run it again to refresh.")
     if bundle:
         st.markdown("### Analysis")
         _render_result(bundle)

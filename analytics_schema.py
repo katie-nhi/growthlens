@@ -19,6 +19,7 @@ caller has obtained explicit user consent.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, List, Optional
 
@@ -283,15 +284,19 @@ def column_by_name(schema: Dict[str, Any], name: str) -> Optional[Dict[str, Any]
 def public_payload(
     df: pd.DataFrame,
     schema: Dict[str, Any],
-    include_categories: bool = True,
+    include_categories: bool = False,
     low_card_threshold: int = 20,
 ) -> Dict[str, Any]:
     """Build a sanitized payload safe to send to an optional LLM provider.
 
     * No raw rows are included.
     * Identifier-like columns are reduced to type/role/distinct-count only.
-    * Low-cardinality categories are shared only when ``include_categories`` is
-      True and the column is not identifier-like or sensitive.
+    * Columns matching :data:`NEVER_SHARE` (email/name/phone/address/...) never
+      expose their values.
+    * Low-cardinality category labels are shared only when
+      ``include_categories`` is explicitly True AND the column is not
+      identifier-like or sensitive. The default is False so that any new caller
+      must opt in to sharing even non-sensitive category labels.
     """
     cols: List[Dict[str, Any]] = []
     for col in schema["columns"]:
@@ -326,3 +331,103 @@ def public_payload(
         "timestamps_present": bool(schema["timestamps"]),
         "events_present": bool(schema["events"]),
     }
+
+
+# ---------------------------------------------------------------------------
+# Strict outbound sanitization (planning + explanation)
+# ---------------------------------------------------------------------------
+
+# A value column is unsafe to forward when it is an identifier, matches a
+# sensitive-name pattern, or has too many distinct values to be a "category".
+_REDACT = "<redacted>"
+
+
+def column_is_sensitive(schema: Dict[str, Any], name: str, low_card_threshold: int = 20) -> bool:
+    """True when a column's *values* must never be forwarded to an LLM.
+
+    Result tables contain both source columns (grouping keys, which may be
+    identifiers/PII) and derived metric columns (``rows``, ``sum(amount)``, ...).
+    Only source columns can be sensitive; a name that is not in the schema is a
+    derived metric/label and is safe to forward.
+    """
+    col = column_by_name(schema, name)
+    if col is None:
+        return False
+    if col.get("is_identifierish") or col.get("role") == "identifier":
+        return True
+    if NEVER_SHARE.search(name):
+        return True
+    if col.get("role") in ("dimension", "event") or col.get("dtype") in ("text", "boolean"):
+        return int(col.get("nunique", 0)) > low_card_threshold
+    return False
+
+
+def sanitize_text(text: str, sensitive_values: List[str]) -> str:
+    if not text:
+        return text
+    text_out = text
+    for s in sensitive_values or []:
+        if not s:
+            continue
+        text_out = re.sub(re.escape(str(s)), "<redacted>", text_out)
+    # Mask email-like strings that may appear in notes/errors.
+    text_out = re.sub(r"[\w\.-]+@[\w\.-]+\.[\w]+", "<redacted>", text_out)
+    return text_out
+
+
+def sanitize_notes(notes: List[Any], plan: Optional[Dict[str, Any]] = None) -> List[str]:
+    sensitive: List[str] = []
+    if plan:
+        for f in plan.get("filters") or []:
+            v = f.get("value")
+            if isinstance(v, (list, tuple)):
+                for b in v:
+                    if b is not None and str(b) != "":
+                        sensitive.append(str(b))
+            elif v is not None and str(v) != "":
+                sensitive.append(str(v))
+    out: List[str] = []
+    for n in notes or []:
+        out.append(sanitize_text(str(n), sensitive))
+    return out
+
+
+def sanitize_table_preview(
+    table: pd.DataFrame,
+    schema: Dict[str, Any],
+    max_rows: int = 10,
+    low_card_threshold: int = 20,
+) -> Dict[str, Any]:
+    """Return a rows-only preview with sensitive/identifier value columns redacted.
+    """
+    if table is None or table.empty:
+        return {"rows": [], "redacted_columns": []}
+    preview = table.head(max_rows).copy()
+    redacted: List[str] = []
+    for col in preview.columns:
+        if column_is_sensitive(schema, str(col), low_card_threshold):
+            preview[col] = _REDACT
+            redacted.append(str(col))
+    rows = json.loads(preview.to_json(orient="records", date_format="iso")) if not preview.empty else []
+    return {"rows": rows, "redacted_columns": redacted}
+
+
+def sanitize_plan(plan: Dict[str, Any], schema: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return a copy of an analysis plan with literal values redacted.
+
+    Column *names* are kept (the explanation needs them), but user-supplied
+    literal values (filter values, and any value on a sensitive/identifier
+    column) are replaced with ``<redacted>`` so a typed-in email or visitor id
+    cannot leak out through the plan.
+    """
+    schema = schema or {}
+    safe = dict(plan)
+    if safe.get("filters"):
+        safe["filters"] = [
+            {**f, "value": _REDACT} for f in safe["filters"]
+        ]
+    if schema:
+        for key in ("x", "y"):
+            if safe.get(key) and column_is_sensitive(schema, safe[key]):
+                safe[key] = _REDACT
+    return safe

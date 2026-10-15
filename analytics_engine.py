@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 import analytics_schema
+import standard_reports
 
 ALLOWED_INTENTS = {
     "groupby_aggregate",
@@ -61,6 +62,40 @@ def _is_identifierish(schema: Dict[str, Any], name: str) -> bool:
     return bool(c and (c.get("is_identifierish") or c.get("role") == "identifier"))
 
 
+def _coerce_number(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _filter_errors(f: Dict[str, Any], schema: Dict[str, Any]) -> List[str]:
+    """Return validation errors for a single filter (fail-closed, no skipping).
+
+    Error strings deliberately name only the *column* and *operator* - never the
+    user-supplied literal value - so a filter value can never leak through an
+    error message that later reaches an external explanation call.
+    """
+    col, op, value = f.get("column"), f.get("op"), f.get("value")
+    if op not in ALLOWED_FILTER_OPS:
+        return [f"Unsupported filter operator: {op!r}."]
+    if op in (">", "<", ">=", "<="):
+        if not _is_numeric(schema, col):
+            return [f"Filter '{op}' needs a numeric column, but '{col}' is not numeric."]
+        if _coerce_number(value) is None:
+            return [f"Filter '{col} {op}' needs a numeric value."]
+    elif op == "between":
+        if not _is_numeric(schema, col):
+            return [f"Filter 'between' needs a numeric column, but '{col}' is not numeric."]
+        bounds = value if isinstance(value, (list, tuple)) else None
+        if bounds is None or len(bounds) != 2 or any(_coerce_number(b) is None for b in bounds):
+            return [f"Filter '{col} between' needs two numeric bounds."]
+    elif op in ("in", "not_in"):
+        if not isinstance(value, (list, tuple)):
+            return [f"Filter '{col} {op}' needs a list of values."]
+    return []
+
+
 def _time_series(df: pd.DataFrame, name: str, schema: Dict[str, Any]) -> pd.Series:
     col = _col(schema, name)
     unit = col.get("epoch_unit") if col else None
@@ -88,8 +123,10 @@ def _apply_filters(df: pd.DataFrame, filters: List[Dict[str, Any]]) -> Tuple[pd.
     work = df
     for f in filters or []:
         name, op, value = f.get("column"), f.get("op"), f.get("value")
-        if name not in work.columns or op not in ALLOWED_FILTER_OPS:
-            continue
+        if name not in work.columns:
+            raise ValueError(f"filter column '{name}' is not present in the data")
+        if op not in ALLOWED_FILTER_OPS:
+            raise ValueError(f"filter operator '{op}' is not supported")
         series = work[name]
         try:
             if op == "==":
@@ -112,14 +149,16 @@ def _apply_filters(df: pd.DataFrame, filters: List[Dict[str, Any]]) -> Tuple[pd.
             elif op == "contains":
                 mask = series.astype(str).str.contains(str(value), case=False, na=False)
             elif op == "between":
-                lo, hi = (value or [None, None])[0], (value or [None, None])[1]
+                bounds = list(value)
                 numeric = pd.to_numeric(series, errors="coerce")
-                mask = (numeric >= float(lo)) & (numeric <= float(hi))
+                mask = (numeric >= float(bounds[0])) & (numeric <= float(bounds[1]))
             else:  # pragma: no cover - guarded above
-                continue
+                raise ValueError(f"filter operator '{op}' is not supported")
             work = work[mask.fillna(False)]
-        except Exception:  # noqa: BLE001
-            notes.append(f"Filter on '{name}' ({op} {value!r}) was skipped (invalid values).")
+        except (TypeError, ValueError, IndexError, KeyError) as exc:
+            # Do NOT include the raw exception text: it can embed the
+            # user-supplied literal (e.g. float("alice@example.com")).
+            raise ValueError(f"filter on '{name}' ({op}) could not be applied") from exc
     return work, notes
 
 
@@ -184,7 +223,14 @@ def validate_plan(plan: Dict[str, Any], schema: Dict[str, Any]) -> Tuple[bool, L
     for g in plan.get("group_by") or []:
         require(g)
     for f in plan.get("filters") or []:
-        require(f.get("column"))
+        col = f.get("column")
+        if not col:
+            missing.append("a filter column")
+            continue
+        if col not in names:
+            require(col)
+            continue
+        errors.extend(_filter_errors(f, schema))
 
     time = plan.get("time") or {}
     require(time.get("column"))
@@ -241,7 +287,10 @@ def execute_plan(df: pd.DataFrame, plan: Dict[str, Any], schema: Dict[str, Any])
         return _empty(plan.get("intent", "unsupported"), note)
 
     intent = plan["intent"]
-    work, filter_notes = _apply_filters(df, plan.get("filters") or [])
+    try:
+        work, filter_notes = _apply_filters(df, plan.get("filters") or [])
+    except ValueError as exc:
+        return _empty(intent, f"The analysis could not be run because a filter was invalid: {exc}")
 
     if intent == "groupby_aggregate":
         result = _run_groupby(work, plan)
@@ -397,13 +446,18 @@ def _run_funnel(work: pd.DataFrame, plan: Dict[str, Any], schema: Dict[str, Any]
     first_users = int(tmp[user].nunique())
     counts: List[int] = []
     last_time: Dict[Any, Any] = {}
-    for stage in stages:
+    for stage_index, stage in enumerate(stages):
         value = stage.get("event_value")
         stage_ts = tmp[tmp[event_col].astype(str) == str(value)]
         accepted = 0
-        new_last: Dict[Any, Any] = dict(last_time)
+        # Only visitors who completed the *immediately previous* stage remain
+        # eligible. A visitor who misses a stage is dropped from the funnel and
+        # can never be counted at a later stage (strictly sequential).
+        new_last: Dict[Any, Any] = {}
         for uid, group in stage_ts.groupby(user):
             threshold = last_time.get(uid)
+            if stage_index > 0 and threshold is None:
+                continue
             times = group["__ts"]
             if threshold is None:
                 earliest = times.min()
@@ -453,48 +507,31 @@ def _run_cohort(work: pd.DataFrame, plan: Dict[str, Any], schema: Dict[str, Any]
     gran = (plan.get("time") or {}).get("period", "W")
     if user not in work.columns or ts_col not in work.columns:
         return _empty("cohort", "Cohort retention requires a user ID and a timestamp column.")
-    tmp = work[[user, ts_col]].copy()
-    tmp["__ts"] = _time_series(tmp, ts_col, schema)
-    tmp = tmp.dropna(subset=[user, "__ts"])
-    if tmp.empty:
-        return _empty("cohort", "No valid timestamped rows were available for a cohort.")
-
-    first = tmp.groupby(user)["__ts"].min()
-    tmp["__cohort"] = _period_floor(tmp[user].map(first), gran)
-    tmp["__period"] = _period_floor(tmp["__ts"], gran)
-    tmp["__index"] = _period_index(tmp["__cohort"], tmp["__period"], gran)
-    tmp = tmp[tmp["__index"] >= 0]
-    deduped = tmp.drop_duplicates(subset=[user, "__index"])
-
-    pivot = (
-        deduped.groupby(["__cohort", "__index"])[user]
-        .nunique()
-        .unstack(fill_value=0)
-        .sort_index()
-    )
-    sizes = pivot[0] if 0 in pivot.columns else pivot.sum(axis=1)
-    retention = pivot.div(sizes.replace(0, pd.NA), axis=0) * 100
-
-    # Right-censor periods that a cohort could not have observed yet.
-    end = tmp["__ts"].max()
-    notes = [
-        "Cohort size is the number of unique users first seen in that period (denominator).",
-        "Cells beyond a cohort's observable window are blank (incomplete follow-up).",
-    ]
-    for cohort_start in retention.index:
-        max_index = int(_period_index(pd.Series([cohort_start]), pd.Series([end]), gran).iloc[0])
-        future = [c for c in retention.columns if c > max_index]
-        retention.loc[cohort_start, future] = pd.NA
-
-    table = retention.round(1).reset_index().rename(columns={"__cohort": "cohort_start"})
-    table.insert(1, "cohort_size", sizes.reindex(retention.index).astype("Int64").values)
+    # Delegate to the exact same core the standard report uses, so the AI answer
+    # and the standard report can never disagree.
+    report = standard_reports.cohort_retention(work, user, ts_col, schema, gran=gran)
+    if not report.get("available"):
+        return _empty("cohort", report.get("reason") or "Cohort retention is unavailable.")
     return {
         "intent": "cohort",
-        "table": table,
+        "table": report["table"],
         "scalar": None,
-        "chart": {"kind": "heatmap", "title": "Cohort retention % (blank = not yet observable)"},
-        "notes": notes,
+        "chart": {"kind": "heatmap", "title": report["chart"]["title"]},
+        "notes": list(report.get("notes") or []),
         "meta": {"granularity": gran},
+    }
+
+
+def _numeric_summary(series: pd.Series) -> Dict[str, Any]:
+    clean = pd.to_numeric(series, errors="coerce").dropna()
+    if clean.empty:
+        return {"count": 0}
+    # Deliberately excludes min/max: on small samples those equal an individual
+    # raw value, which we do not want leaving the process.
+    return {
+        "count": int(clean.count()),
+        "mean": round(float(clean.mean()), 4),
+        "std": round(float(clean.std()), 4) if clean.count() > 1 else 0.0,
     }
 
 
@@ -506,11 +543,21 @@ def _run_correlation(work: pd.DataFrame, plan: Dict[str, Any]) -> Dict[str, Any]
     if len(pair) < 3:
         return _empty("correlation", "Not enough numeric rows to compute a correlation.")
     value = float(pair[x].corr(pair[y]))
+    # The raw observation pairs stay ONLY in ``table`` (used for the local
+    # scatterplot and download). Only the aggregate summary below is ever
+    # eligible to be forwarded for an explanation - never the pairs themselves.
+    summary = {
+        "method": "pearson",
+        "correlation": round(value, 4),
+        "valid_pairs": int(len(pair)),
+        x: _numeric_summary(pair[x]),
+        y: _numeric_summary(pair[y]),
+    }
     return {
         "intent": "correlation",
         "table": pd.DataFrame({x: pair[x], y: pair[y]}).head(1000),
         "scalar": round(value, 4),
         "chart": {"kind": "scatter", "x": x, "y": y, "title": f"{y} vs {x}"},
         "notes": ["This is an association (Pearson correlation), NOT evidence of causation."],
-        "meta": {},
+        "meta": {"summary": summary},
     }
